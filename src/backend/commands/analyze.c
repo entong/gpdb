@@ -210,6 +210,13 @@ typedef struct
     ArrayType ** output;
 } EachResultColumnAsArraySpec;
 
+typedef struct
+{
+	int null_cnt;
+	MemoryContext resultColumnMemContext;
+	Datum *result;
+} ResultColumnSpec;
+
 static void spiCallback_getEachResultColumnAsArray(void *clientData);
 static void spiCallback_getProcessedAsFloat4(void *clientData);
 static void spiCallback_getSingleResultRowArrayAsTwoFloat4(void *clientData);
@@ -1248,6 +1255,12 @@ static void spiCallback_getEachResultColumnAsArray(void *clientData)
     }
 }
 
+static void spiCallback_getSampleColumn(void *clientData)
+{
+	ResultColumnSpec *spec = (ResultColumnSpec*) clientData;
+
+}
+
 /**
  * This method builds a sampled version of the given relation. The sampled
  * version is created in a temp namespace. Note that ANALYZE can be
@@ -1908,6 +1921,7 @@ static bool isNotNull(Oid relationOid, const char *attributeName)
 	return (nonNull);
 }
 
+
 /**
  * Computes the absolute number of NULLs in the sample table.
  * Input:
@@ -2542,6 +2556,9 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 	stats->mcv = NULL;
 	stats->freq = NULL;
 	stats->hist = NULL;
+
+	Datum *values = (Datum *) palloc(sizeof(Datum) * (int) sampleTableRelTuples);
+
 		
 	if (isNotNull(relationOid, attributeName))
 	{
