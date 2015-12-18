@@ -212,6 +212,7 @@ typedef struct
 
 typedef struct
 {
+	int total_cnt;
 	int null_cnt;
 	MemoryContext resultColumnMemContext;
 	Datum *result;
@@ -1258,7 +1259,45 @@ static void spiCallback_getEachResultColumnAsArray(void *clientData)
 static void spiCallback_getSampleColumn(void *clientData)
 {
 	ResultColumnSpec *spec = (ResultColumnSpec*) clientData;
+	int i = 0;
+	bool isNull = false;
+	int null_cnt = 0;
 
+	/* Since we are retrieving one column at a time, the attribute number
+	 * should always be 0.
+	 */
+	int attnum = 0;
+
+    Assert(SPI_tuptable != NULL);
+    Assert(SPI_tuptable->tupdesc);
+
+    MemoryContext callerContext = MemoryContextSwitchTo(spec->resultColumnMemContext);
+    Form_pg_attribute attr = SPI_tuptable->tupdesc->attrs[attnum];
+
+    bool isVarlena = (!attr->attbyval) && attr->attlen == -1;
+
+
+    for (i = 0; i < SPI_processed; i++)
+    {
+    	Datum dValue = heap_getattr(SPI_tuptable->vals[i], attnum, SPI_tuptable->tupdesc, &isNull);
+    	Datum deToasted = dValue;
+    	spec->total_cnt++;
+
+    	if (isNull)
+    	{
+    		null_cnt++;
+    		continue;
+    	}
+
+		if (isVarlena)
+		{
+			deToasted = PointerGetDatum(PG_DETOAST_DATUM(dValue));
+		}
+
+		spec->result[i] = deToasted;
+    }
+
+    MemoryContextSwitchTo(callerContext);
 }
 
 /**
@@ -2558,6 +2597,22 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 	stats->hist = NULL;
 
 	Datum *values = (Datum *) palloc(sizeof(Datum) * (int) sampleTableRelTuples);
+	StringInfo str = makeStringInfo();
+	const char *sampleSchemaName = get_namespace_name(get_rel_namespace(sampleTableOid));
+	const char *sampleTableName = get_rel_name(sampleTableOid);
+
+	appendStringInfo(str, "select tbl.%s from %s.%s as tbl",
+			quote_identifier(attributeName), quote_identifier(sampleSchemaName), quote_identifier(sampleTableName));
+	ResultColumnSpec spec;
+	spec.null_cnt = 0;
+	spec.total_cnt = 0;
+	spec.resultColumnMemContext = CurrentMemoryContext;
+	spec.result = values;
+
+	spiExecuteWithCallback(str->data, false /*readonly*/, 0 /*tcount*/,
+			spiCallback_getSampleColumn, &spec);
+
+	elog(INFO, "null count is %d", spec.null_cnt);
 
 		
 	if (isNotNull(relationOid, attributeName))
