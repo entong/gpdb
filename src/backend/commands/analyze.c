@@ -129,7 +129,7 @@ static void analyzeEstimateReltuplesRelpages(Oid relationOid, float4 *relTuples,
 static void analyzeEstimateIndexpages(Oid relationOid, Oid indexOid, float4 *indexPages);
 
 /* Attribute-type related functions */
-static bool isOrderedAndHashable(Oid typid);
+static bool isOrderedAndHashable(Oid typid, Oid *ltopr);
 static bool hasMaxDefined(Oid typid);
 
 /* Sampling related */
@@ -192,6 +192,9 @@ static void updateAttributeStatisticsInCatalog(Oid relationOid, const char *attr
 		AttributeStatistics *stats);
 static void updateReltuplesRelpagesInCatalog(Oid relationOid, float4 relTuples, float4 relPages);
 
+/* sorting related */
+static int	compare_scalars(const void *a, const void *b, void *arg);
+
 /* Convenience */
 static ArrayType * SPIResultToArray(int resultAttributeNumber, MemoryContext allocationContext);
 
@@ -209,13 +212,33 @@ typedef struct
 
 typedef struct
 {
+	Datum		value;			/* a data value */
+	int			tupno;			/* position index for tuple it came from */
+} ScalarItem;
+
+typedef struct
+{
+	int			count;			/* # of duplicates */
+	int			first;			/* values[] index of first occurrence */
+} ScalarMCVItem;
+
+typedef struct
+{
+	FmgrInfo   *cmpFn;
+	int			cmpFlags;
+	int		   *tupnoLink;
+} CompareScalarsContext;
+
+typedef struct
+{
 	int values_cnt;
 	int null_cnt;
 	int nonnull_cnt;
 	double total_width;
 	Form_pg_attribute attr;
 	MemoryContext resultColumnMemContext;
-	Datum *result;
+	ScalarItem *result;
+	int *tupnoLink;
 } ResultColumnSpec;
 
 static void spiCallback_getEachResultColumnAsArray(void *clientData);
@@ -1285,7 +1308,7 @@ static void spiCallback_getSampleColumn(void *clientData)
     spec->attr = (Form_pg_attribute) palloc(ATTRIBUTE_TUPLE_SIZE);
     memcpy(spec->attr, attr, ATTRIBUTE_TUPLE_SIZE);
 
-    bool isVarlena = (!attr->attbyval) && attr->attlen == -1;
+    bool is_varlena = (!attr->attbyval) && attr->attlen == -1;
     bool is_varwidth = (!attr->attbyval) && attr->attlen < 0;
 
     for (i = 0; i < SPI_processed; i++)
@@ -1299,7 +1322,7 @@ static void spiCallback_getSampleColumn(void *clientData)
     	}
     	spec->nonnull_cnt++;
 
-		if (isVarlena)
+		if (is_varlena)
 		{
 			spec->total_width += VARSIZE_ANY(DatumGetPointer(dValue));
 
@@ -1316,7 +1339,10 @@ static void spiCallback_getSampleColumn(void *clientData)
 			spec->total_width += strlen(DatumGetCString(dValue)) + 1;
 		}
 
-		spec->result[spec->values_cnt++] = dValue;
+		spec->result[spec->values_cnt].value = dValue;
+		spec->result[spec->values_cnt].tupno = spec->values_cnt;
+		spec->tupnoLink[spec->values_cnt] = spec->values_cnt;
+		spec->values_cnt++;
     }
 
     MemoryContextSwitchTo(callerContext);
@@ -1696,9 +1722,10 @@ static void updateReltuplesRelpagesInCatalog(Oid relationOid, float4 relTuples, 
  * Input:
  * 	typid - oid of column type
  * Output:
- * 	true if operators are defined and the attribute type is hashable, false otherwise. 
+ * 	True if operators are defined and the attribute type is hashable, false otherwise.
+ * 	Also returns the oid of the "<" operator if available or null otherwise
  */
-static bool isOrderedAndHashable(Oid typid)
+static bool isOrderedAndHashable(Oid typid, Oid *ltopr)
 {
 	Operator	equalityOperator = NULL;
 	Operator	ltOperator = NULL;
@@ -1714,9 +1741,15 @@ static bool isOrderedAndHashable(Oid typid)
 	/* Does type have "<" operator */
 	ltOperator = ordering_oper(typid, true);
 	if (!ltOperator)
+	{
+		*ltopr = 0;
 		result = false;
+	}
 	else
+	{
+		*ltopr = oprid(ltOperator);
 		ReleaseOperator(ltOperator);
+	}
 	
 	/* Is the attribute hashable?*/
 	if (!isGreenplumDbHashable(typid))
@@ -2480,7 +2513,6 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 		bool mergeStats,
 		AttributeStatistics *stats)
 {
-	bool computeWidth = true;
 	bool computeDistinct = true;
 	bool computeMCV = true;
 	bool computeHist = true;
@@ -2496,7 +2528,8 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 	stats->freq = NULL;
 	stats->hist = NULL;
 
-	Datum *values = (Datum *) palloc(sizeof(Datum) * (int) sampleTableRelTuples);
+	ScalarItem *values = (ScalarItem *) palloc(sizeof(ScalarItem) * (int) sampleTableRelTuples);
+	int *tupnoLink = (int*) palloc(sizeof(int) * (int) sampleTableRelTuples);
 
 	instr_time      starttime, endtime;
 	INSTR_TIME_SET_CURRENT(starttime);
@@ -2507,12 +2540,14 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 
 	appendStringInfo(str, "select tbl.%s from %s.%s as tbl",
 			quote_identifier(attributeName), quote_identifier(sampleSchemaName), quote_identifier(sampleTableName));
+
 	ResultColumnSpec spec;
 	spec.null_cnt = 0;
 	spec.nonnull_cnt = 0;
 	spec.values_cnt = 0;
 	spec.resultColumnMemContext = CurrentMemoryContext;
 	spec.result = values;
+	spec.tupnoLink = tupnoLink;
 
 	spiExecuteWithCallback(str->data, false /*readonly*/, 0 /*tcount*/,
 			spiCallback_getSampleColumn, &spec);
@@ -2520,11 +2555,14 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 	INSTR_TIME_SET_CURRENT(endtime);
 	INSTR_TIME_SUBTRACT(endtime, starttime);
 
-	elog(INFO, "time to read sample for column %s: %.1f ms", quote_identifier(attributeName), INSTR_TIME_GET_MILLISEC(endtime));
-	elog(INFO, "null count is %d", spec.null_cnt);
-	elog(INFO, "value count is %d", spec.values_cnt);
+	elog(INFO, "\ntime to read sample for column %s: %.1f ms", quote_identifier(attributeName), INSTR_TIME_GET_MILLISEC(endtime));
 
 	Form_pg_attribute attr = spec.attr;
+	Oid ltopr;
+	Oid	cmpFn;
+	int	cmpFlags;
+	FmgrInfo f_cmpfn;
+	int toowide_cnt = spec.nonnull_cnt - spec.values_cnt;
 
 	if (attr->attnotnull)
 	{
@@ -2532,23 +2570,13 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 	}
 	else
 	{
-		if (spec.null_cnt >= ceil(sampleTableRelTuples))
-		{
-			/**
-			 * All values are null. no point computing other statistics.
-			 */
-			computeWidth = false;
-			computeDistinct = false;
-			computeMCV = false;
-			computeHist = false;
-		}
 		stats->nullFraction = Min(spec.null_cnt / sampleTableRelTuples, 1.0);
 	}
 
 	elog(elevel, "nullfrac = %.6f", stats->nullFraction);
 	
 	bool is_varwidth = !attr->attbyval && attr->attlen < 0;
-	if (computeWidth)
+	if (spec.null_cnt < ceil(sampleTableRelTuples))
 	{
 		Assert(spec.nonnull_cnt > 0); /* we should not be here if all values are null */
 		stats->avgWidth = is_varwidth ? spec.total_width / (double) spec.nonnull_cnt : attr->attlen;
@@ -2556,14 +2584,18 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 	
 	elog(elevel, "avgwidth = %f", stats->avgWidth);		
 	
-	if (stats->avgWidth > COLUMN_WIDTH_THRESHOLD || !isOrderedAndHashable(attr->atttypid))
+	if (spec.values_cnt == 0 || stats->avgWidth > COLUMN_WIDTH_THRESHOLD || !isOrderedAndHashable(attr->atttypid, &ltopr))
 	{
-		/* We do not collect advanced stats if the column is too wide or not ordered-and-hashable */
+		/* We do not collect advanced stats if the column is all null values or
+		 * too wide or not ordered-and-hashable */
 		computeDistinct = false;
 		computeMCV = false;
 		computeHist = false;
+
+		return;
 	}
-	else if (attr->atttypid == BOOLOID)
+
+	if (attr->atttypid == BOOLOID)
 	{
 		/* For boolean type we only need to collect MCV */
 		stats->ndistinct = 2;
@@ -2580,22 +2612,151 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 
 	INSTR_TIME_SET_CURRENT(starttime);
 
+	Assert(ltopr != InvalidOid); /* at this point, column type must have "<" operator defined */
+	SelectSortFunction(ltopr, false, &cmpFn, &cmpFlags);
+	fmgr_info(cmpFn, &f_cmpfn);
+	CompareScalarsContext cxt;
+
+	/* Sort the collected values */
+	cxt.cmpFn = &f_cmpfn;
+	cxt.cmpFlags = cmpFlags;
+	cxt.tupnoLink = spec.tupnoLink;
+	qsort_arg((void *) values, spec.values_cnt, sizeof(ScalarItem),
+			  compare_scalars, (void *) &cxt);
+
+	INSTR_TIME_SET_CURRENT(endtime);
+	INSTR_TIME_SUBTRACT(endtime, starttime);
+	elog(INFO, "time to sort the array of datums: %.1f ms", INSTR_TIME_GET_MILLISEC(endtime));
+	INSTR_TIME_SET_CURRENT(starttime);
+
+	int i = 0;
+	int ndistinct = 0;
+	int nmultiple = 0;
+	int dups_cnt = 0;
+	int track_cnt = 0;
+	int num_mcv = attr->attstattarget < 0 ? default_statistics_target : attr->attstattarget;
+	int num_hist = num_mcv;
+	ScalarMCVItem *track = (ScalarMCVItem *) palloc(num_mcv * sizeof(ScalarMCVItem));
+
+	/*
+	 * Now scan the values in order, find the most common ones, and also
+	 * accumulate ordering-correlation statistics.
+	 *
+	 * To determine which are most common, we first have to count the
+	 * number of duplicates of each value.	The duplicates are adjacent in
+	 * the sorted list, so a brute-force approach is to compare successive
+	 * datum values until we find two that are not equal. However, that
+	 * requires N-1 invocations of the datum comparison routine, which are
+	 * completely redundant with work that was done during the sort.  (The
+	 * sort algorithm must at some point have compared each pair of items
+	 * that are adjacent in the sorted order; otherwise it could not know
+	 * that it's ordered the pair correctly.) We exploit this by having
+	 * compare_scalars remember the highest tupno index that each
+	 * ScalarItem has been found equal to.	At the end of the sort, a
+	 * ScalarItem's tupnoLink will still point to itself if and only if it
+	 * is the last item of its group of duplicates (since the group will
+	 * be ordered by tupno).
+	 */
+
+	for (i = 0; i < spec.values_cnt; i++)
+	{
+		int	tupno = values[i].tupno;
+
+		dups_cnt++;
+		if (spec.tupnoLink[tupno] == tupno)
+		{
+			/* Reached end of duplicates of this value */
+			ndistinct++;
+			if (dups_cnt > 1)
+			{
+				nmultiple++;
+				if (track_cnt < num_mcv ||
+					dups_cnt > track[track_cnt - 1].count)
+				{
+					/*
+					 * Found a new item for the mcv list; find its
+					 * position, bubbling down old items if needed. Loop
+					 * invariant is that j points at an empty/ replaceable
+					 * slot.
+					 */
+					int	j = 0;
+
+					if (track_cnt < num_mcv)
+						track_cnt++;
+					for (j = track_cnt - 1; j > 0; j--)
+					{
+						if (dups_cnt <= track[j - 1].count)
+							break;
+						track[j].count = track[j - 1].count;
+						track[j].first = track[j - 1].first;
+					}
+					track[j].count = dups_cnt;
+					track[j].first = i + 1 - dups_cnt;
+				}
+			}
+			dups_cnt = 0;
+		}
+	}
+
+	INSTR_TIME_SET_CURRENT(endtime);
+	INSTR_TIME_SUBTRACT(endtime, starttime);
+	elog(INFO, "time to traverse array of datums: %.1f ms", INSTR_TIME_GET_MILLISEC(endtime));
+	INSTR_TIME_SET_CURRENT(starttime);
+
 	if (computeDistinct)
 	{
-		if (mergeStats)
+		if (nmultiple == 0)
 		{
-			stats->ndistinct = analyzeComputeNDistinctByLargestPartition(relationOid, relTuples, attributeName);
+			/* If we found no repeated values, assume it's a unique column */
+			stats->ndistinct = -1.0;
+
+			/*
+			 * If there are many more distinct values than mcv buckets,
+			 * we can ignore computing mcv values.
+			 */
+			if (ndistinct > num_mcv)
+				computeMCV = false;
+		}
+		else if (toowide_cnt == 0 && nmultiple == ndistinct)
+		{
+			/*
+			 * Every value in the sample appeared more than once.  Assume the
+			 * column has just these values.
+			 */
+			stats->ndistinct = ndistinct;
 		}
 		else
 		{
-			analyzeComputeNDistinctBySample(relationOid, relTuples, sampleTableOid, sampleTableRelTuples,
-																attributeName, &computeMCV, &computeHist, stats);
-		}
+			/*----------
+			 * Estimate the number of distinct values using the estimator
+			 * proposed by Haas and Stokes in IBM Research Report RJ 10025:
+			 *		n*d / (n - f1 + f1*n/N)
+			 * where f1 is the number of distinct values that occurred
+			 * exactly once in our sample of n rows (from a total of N),
+			 * and d is the total number of distinct values in the sample.
+			 * This is their Duj1 estimator; the other estimators they
+			 * recommend are considerably more complex, and are numerically
+			 * very unstable when n is much smaller than N.
+			 *
+			 * Overwidth values are assumed to have been distinct.
+			 *----------
+			 */
+			int			f1 = ndistinct - nmultiple + toowide_cnt;
+			int			d = f1 + nmultiple;
+			double		numer, denom;
 
-		/* upper bound */
-		if (stats->ndistinct > relTuples)
-		{
-			stats->ndistinct = relTuples;
+			numer = (double) sampleTableRelTuples * (double) d;
+
+			denom = (double) (sampleTableRelTuples - f1) +
+				(double) f1 * (double) sampleTableRelTuples / relTuples;
+
+			stats->ndistinct = numer / denom;
+			/* Clamp to sane range in case of roundoff error */
+			if (stats->ndistinct < (double) d)
+				stats->ndistinct = (double) d;
+			if (stats->ndistinct > relTuples)
+				stats->ndistinct = relTuples;
+			stats->ndistinct = floor(stats->ndistinct + 0.5);
 		}
 
 		/**
@@ -2603,14 +2764,14 @@ static void analyzeComputeAttributeStatistics(Oid relationOid,
 		 */
 		if (stats->ndistinct > relTuples * gp_statistics_ndistinct_scaling_ratio_threshold)
 		{
-			stats->ndistinct = -1.0 * stats->ndistinct / relTuples;
+			stats->ndistinct = -(stats->ndistinct / relTuples);
 		}
 
 	}
 	elog(elevel, "ndistinct = %.6f", stats->ndistinct);
 	INSTR_TIME_SET_CURRENT(endtime);
 	INSTR_TIME_SUBTRACT(endtime, starttime);
-	elog(INFO, "time to collect ndistinct the old way: %.1f ms", INSTR_TIME_GET_MILLISEC(endtime));
+	elog(INFO, "time to collect ndistinct the new way: %.1f ms", INSTR_TIME_GET_MILLISEC(endtime));
 	
 	INSTR_TIME_SET_CURRENT(starttime);
 	if (computeMCV)
@@ -3205,4 +3366,42 @@ gp_statistics_estimate_reltuples_relpages_oid(PG_FUNCTION_ARGS)
 					sizeof(float4), true, 'i');
 
 	PG_RETURN_ARRAYTYPE_P(result);
+}
+
+/*
+ * qsort_arg comparator for sorting ScalarItems
+ *
+ * Aside from sorting the items, we update the tupnoLink[] array
+ * whenever two ScalarItems are found to contain equal datums.	The array
+ * is indexed by tupno; for each ScalarItem, it contains the highest
+ * tupno that that item's datum has been found to be equal to.  This allows
+ * us to avoid additional comparisons in compute_scalar_stats().
+ */
+static int
+compare_scalars(const void *a, const void *b, void *arg)
+{
+	Datum		da = ((ScalarItem *) a)->value;
+	int			ta = ((ScalarItem *) a)->tupno;
+	Datum		db = ((ScalarItem *) b)->value;
+	int			tb = ((ScalarItem *) b)->tupno;
+	CompareScalarsContext *cxt = (CompareScalarsContext *) arg;
+	int32		compare;
+
+	compare = ApplySortFunction(cxt->cmpFn, cxt->cmpFlags,
+								da, false, db, false);
+	if (compare != 0)
+		return compare;
+
+	/*
+	 * The two datums are equal, so update cxt->tupnoLink[].
+	 */
+	if (cxt->tupnoLink[ta] < tb)
+		cxt->tupnoLink[ta] = tb;
+	if (cxt->tupnoLink[tb] < ta)
+		cxt->tupnoLink[tb] = ta;
+
+	/*
+	 * For equal datums, sort by tupno
+	 */
+	return ta - tb;
 }
